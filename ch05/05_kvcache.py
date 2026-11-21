@@ -1,3 +1,8 @@
+# Concept: key/value caching reuses past attention projections during autoregressive decoding.
+# Goal: contrast repeated full-prefix inference with one-token cached inference.
+# The script measures both approaches on the same randomly initialized GPT shape.
+# KV-cache state is maintained separately inside each attention block.
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -28,7 +33,7 @@ class RoPE(nn.Module):
         input_dtype = x.dtype
         x = x.float()
 
-        # offsetを考慮して位置エンコーディングを取得
+        # Select RoPE rows at the current absolute offset, not from position zero.
         max_context_len = self.cos_cache.size(0)
         if offset + context_len > max_context_len:
             offset = max_context_len - context_len
@@ -48,6 +53,8 @@ class RoPE(nn.Module):
         return out.to(input_dtype)
 
 
+# KV means key and value: past projections do not change during decoding. Reuse avoids recomputation;
+# memory grows with B*H*past_tokens*D for each cached tensor.
 class MultiHeadAttention(nn.Module):
     def __init__(self, embed_dim, n_head, head_dim, rope=None):
         super().__init__()
@@ -62,10 +69,10 @@ class MultiHeadAttention(nn.Module):
 
         self.rope = rope
 
-        # KV-Cache用の変数を追加
-        self.k_cache = None  # Keyのキャッシュ
-        self.v_cache = None  # Valueのキャッシュ
-        self.cache_offset = 0  # 現在のキャッシュ位置を追跡
+        # Per-layer inference state: cached K/V tensors have shape (B,H,past_tokens,D).
+        self.k_cache = None  # Cached keys for earlier tokens.
+        self.v_cache = None  # Reuse past values instead of recomputing the prefix.
+        self.cache_offset = 0  # Absolute position of the next token.
 
     def forward(self, x, use_cache=False):
         B, C, E = x.shape
@@ -79,7 +86,7 @@ class MultiHeadAttention(nn.Module):
         K = K.view(B, C, H, D).transpose(1, 2)
         V = V.view(B, C, H, D).transpose(1, 2)
 
-        # RoPEにoffsetを渡す
+        # Pass the absolute cache offset to RoPE so new tokens receive true positions.
         if self.rope is not None:
             if use_cache:
                 Q = self.rope(Q, self.cache_offset)
@@ -88,32 +95,34 @@ class MultiHeadAttention(nn.Module):
                 Q = self.rope(Q)
                 K = self.rope(K)
 
-        # KV-Cacheの処理
+        # Cache tensors are ordinary device tensors, not trainable parameters.
+        # Handle cached keys/values for autoregressive decoding.
         if use_cache:
-            # Prefill（初回）かDecode（2回目以降）かを判定
+            # First call is prompt prefill; later calls append newly projected token(s).
             is_first_call = (self.k_cache is None)
 
             if is_first_call:
-                # 初回:キャッシュを初期化
+                # First call: initialize the cache with prompt keys and values.
                 self.k_cache = K
                 self.v_cache = V
             else:
-                # 2回目以降:新しいKeyとValueをキャッシュに追加
+                # Later calls: append newly projected keys and values along the sequence axis.
                 self.k_cache = torch.cat([self.k_cache, K], dim=2)
                 self.v_cache = torch.cat([self.v_cache, V], dim=2)
 
-            # オフセットを更新(次のトークンの位置へ)
+            # Advance the absolute token position for the next RoPE row.
             self.cache_offset += C
 
-            # キャッシュされた全てのKeyとValueを使用
+            # Use all keys and values accumulated so far.
             K = self.k_cache
             V = self.v_cache
 
-        # 通常のAttention計算
+        # Compute scaled dot-product attention over current queries and available keys.
+        # Cached shapes: Q=(B,H,new,D), K=(B,H,past+new,D), scores=(B,H,new,past+new).
         scores = torch.matmul(Q, K.transpose(-2, -1))
         scores = scores / (D ** 0.5)
 
-        # Causal Mask（KVキャッシュ使用時は不要）
+        # Prefill needs a causal mask; a one-token decode query can see cached/current keys.
         if not use_cache or is_first_call:
             mask = torch.tril(torch.ones(C, C, device=scores.device))
             scores = scores.masked_fill(mask == 0, float('-inf'))
@@ -127,7 +136,7 @@ class MultiHeadAttention(nn.Module):
         return output
 
     def clear_cache(self):
-        """キャッシュをクリアする"""
+        """Discard cached keys and values before an independent prompt."""
         self.k_cache = None
         self.v_cache = None
         self.cache_offset = 0
@@ -168,7 +177,7 @@ class Block(nn.Module):
         return x
 
     def clear_cache(self):
-        """キャッシュをクリアする"""
+        """Clear this block’s attention cache."""
         self.attn.clear_cache()
 
 
@@ -247,38 +256,41 @@ class GPT(nn.Module):
         return model
 
     def clear_cache(self):
-        """全てのブロックのキャッシュをクリアする"""
+        """Clear the key/value state in every transformer block."""
         for block in self.blocks:
             block.clear_cache()
 
 
+# torch.no_grad prevents gradient storage because inference does not update weights.
 def generate_without_cache(model, start_ids, max_new_tokens):
     model.eval()
 
-    ids = start_ids  # 最初のトークン
+    ids = start_ids  # Full generated prefix, initially the supplied token(s).
     with torch.no_grad():
         for _ in range(max_new_tokens):
-            # 毎回、全てのトークンを渡す
+            # Without caching, recompute the full prefix at every step.
             logits = model(ids, use_cache=False)
             next_id = torch.argmax(logits[:, -1, :], dim=-1, keepdim=True)
-            # 新しいトークンを連結
+            # Append the selected next token to the growing prefix.
             ids = torch.cat([ids, next_id], dim=1)
 
     return ids
 
+# Cached decoding feeds only the newest token after the initial call; IDs are concatenated for return.
 def generate_with_cache(model, start_ids, max_new_tokens):
     model.eval()
 
-    ids = start_ids  # 最初のトークン
+    ids = start_ids  # Start the generated sequence with the caller-provided token(s).
     next_id = start_ids
     with torch.no_grad():
         for _ in range(max_new_tokens):
-            # 1トークンずつ生成
+            # With caching, feed only the most recently generated token.
             logits = model(next_id, use_cache=True)
             next_id = torch.argmax(logits[:, -1, :], dim=-1, keepdim=True)
             ids = torch.cat([ids, next_id], dim=1)
     return ids
 
+# time.time measures wall seconds; results vary by device, PyTorch build, and system load.
 def measure_generation_time(model, start_ids, use_cache, num_tokens=200):
     if not use_cache:
         model.clear_cache()
@@ -293,19 +305,23 @@ def measure_generation_time(model, start_ids, use_cache, num_tokens=200):
     elapsed = time.time() - start_time
     return elapsed
 
-# テスト
+# Timing demonstration (not a training run).
 model = GPT(vocab_size=1000, max_context_len=256, embed_dim=384,
             n_head=6, n_layer=6, ff_dim=1024)
 
 
-start_ids = torch.tensor([[42]])  # 固定シード
+start_ids = torch.tensor([[42]])  # Fixed single token ID for this greedy-path timing comparison.
 
 time_without = measure_generation_time(model, start_ids, use_cache=False)
 time_with = measure_generation_time(model, start_ids, use_cache=True)
+# Japanese output says “without KV cache” plus elapsed seconds.
 print(f"KV-Cacheなし: {time_without:.2f}秒")
+# Japanese output says “with KV cache” plus elapsed seconds.
 print(f"KV-Cacheあり: {time_with:.2f}秒")
+# Japanese output says “speed-up ratio,” formatted as a multiple.
 print(f"高速化率: {time_without / time_with:.1f}倍")
 
+# The disabled quoted example below contains Japanese console labels meaning “output comparison,” “with/without cache,” and “match.”
 """
 print("\n=== 出力の一致確認 ===")
 model.clear_cache()
@@ -330,3 +346,11 @@ else:
     print("✗ 出力が一致しません")
     print(f"差分の数: {(output_without[:, :max_new_tokens] != output_with[:, :max_new_tokens]).sum().item()}")
 """
+
+# ===== CONCEPT NOTES =====
+# CONCEPT: A KV cache stores already-computed keys and values so each decoding step projects only the new token and attends to cached history. The first call (prefill) processes the prompt with a causal mask; later one-token decode calls attend to all cached positions, so no additional causal mask is needed for that single query.
+# GOAL: Show why caching reduces repeated work in autoregressive generation compared with recomputing the entire prefix at every step. This extends the GPT architecture with cache state and compares elapsed times.
+# INPUT: A randomly initialized GPT uses vocab_size=1000, max_context_len=256, embed_dim=384, n_head=6 (head_dim=64), n_layer=6, and ff_dim=1024. The fixed start_ids tensor is [[42]] with shape (1,1); each timing run generates 200 new tokens by argmax.
+# OUTPUT: Prints elapsed seconds for the no-cache and cache runs, followed by their ratio formatted to one decimal place. The helper generation methods return IDs (here shape (1,201)), but the active script does not print them or save a model/image. A code block at the end containing an optional equality check is inside a triple-quoted string and is not executed.
+# HOW INPUT BECOMES OUTPUT: 1) No-cache generation feeds all current IDs to the model on each of 200 iterations; its sequence grows from 1 to 201. 2) Cached generation feeds the initial token and then one new token each iteration. 3) In every attention layer, K and V are shaped (batch, heads, sequence, 64), appended along sequence dimension 2, while Q for the current input attends over the cache. 4) Both paths select argmax from the last-position logits and concatenate the next token. 5) time.time measures each complete run and the script prints time_without/time_with.
+# NOTES: The measured speed ratio depends on CPU/GPU, PyTorch, and system load; it is not a fixed result. The demo builds a 6-layer model and generates 200 tokens, so CPU timing can be substantial. Cache must be cleared between independent prompts; this script clears it before the no-cache benchmark, while the cache benchmark starts with an empty cache in the freshly used model. The configured context is 256 and this 201-token result stays within it. No external files or GPU are required.
